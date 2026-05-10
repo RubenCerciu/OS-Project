@@ -10,6 +10,8 @@
 #include <time.h>
 #include <errno.h>
 #include <dirent.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 #define NAME_LEN     64
 #define CATEGORY_LEN 32
@@ -25,6 +27,8 @@ typedef struct {
     time_t timestamp;
     char   description[DESC_LEN];
 } Report;
+
+void notify_monitor(const char *district, const char *role, const char *user);
 
 void mode_to_str(mode_t mode, char *out) {
     out[0] = (mode & S_IRUSR) ? 'r' : '-';
@@ -106,7 +110,7 @@ void ensure_district(const char *district) {
     struct stat st;
 
     if (stat(district, &st) != 0) {
-        if (mkdir(district) < 0) {
+        if (mkdir(district, 0750) < 0) {
             fprintf(stderr, "ERROR: cannot create district '%s': %s\n",
                     district, strerror(errno));
             exit(1);
@@ -306,6 +310,7 @@ void cmd_add(const char *district, const char *role, const char *user) {
     }
 
     printf("Report #%d added to district '%s'\n", r.id, district);
+    notify_monitor(district, role, user);
     log_action(district, role, user, "add");
 }
 
@@ -546,6 +551,96 @@ void cmd_filter(const char *district, const char *role, const char *user,
     log_action(district, role, user, "filter");
 }
 
+void notify_monitor(const char *district, const char *role, const char *user) {
+    char logpath[512];
+    snprintf(logpath, sizeof(logpath), "%s/logged_district", district);
+
+    int pidfd = open(".monitor_pid", O_RDONLY);
+    if (pidfd < 0) {
+        int fd = open(logpath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            const char *msg = "monitor not running - could not notify\n";
+            write(fd, msg, strlen(msg));
+            close(fd);
+        }
+        return;
+    }
+
+    char buf[32];
+    memset(buf, 0, sizeof(buf));
+    read(pidfd, buf, sizeof(buf) - 1);
+    close(pidfd);
+
+    char *endp;
+    long pid = strtol(buf, &endp, 10);
+    if (pid <= 0) {
+        int fd = open(logpath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            const char *msg = "monitor pid invalid - could not notify\n";
+            write(fd, msg, strlen(msg));
+            close(fd);
+        }
+        return;
+    }
+
+    int fd = open(logpath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (kill((pid_t)pid, SIGUSR1) == 0) {
+        if (fd >= 0) {
+            char line[256];
+            int len = snprintf(line, sizeof(line),
+                "monitor notified (pid %ld) by %s (%s)\n", pid, user, role);
+            write(fd, line, len);
+        }
+    } else {
+        if (fd >= 0) {
+            char line[256];
+            int len = snprintf(line, sizeof(line),
+                "monitor notify failed (pid %ld): %s\n", pid, strerror(errno));
+            write(fd, line, len);
+        }
+    }
+    if (fd >= 0) close(fd);
+}
+
+void cmd_remove_district(const char *district, const char *role) {
+    if (strcmp(role, "manager") != 0) {
+        fprintf(stderr, "ERROR: only managers can remove districts\n");
+        return;
+    }
+
+    struct stat st;
+    if (stat(district, &st) != 0) {
+        fprintf(stderr, "ERROR: district '%s' does not exist\n", district);
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "ERROR: fork failed: %s\n", strerror(errno));
+        return;
+    }
+
+    if (pid == 0) {
+        char distpath[512];
+        snprintf(distpath, sizeof(distpath), "%s", district);
+        execlp("rm", "rm", "-rf", distpath, (char *)NULL);
+        fprintf(stderr, "ERROR: execlp failed: %s\n", strerror(errno));
+        exit(1);
+    }
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        char linkname[512];
+        snprintf(linkname, sizeof(linkname), "active_reports-%s", district);
+        unlink(linkname);
+        printf("District '%s' removed\n", district);
+    } else {
+        fprintf(stderr, "ERROR: failed to remove district '%s'\n", district);
+    }
+}
+
 void check_symlinks(void) {
     DIR *d = opendir(".");
     if (!d) return;
@@ -569,8 +664,9 @@ static void usage(const char *prog) {
         "  %s --role <role> --user <n> --view <district> <report_id>\n"
         "  %s --role manager --user <n> --remove_report <district> <report_id>\n"
         "  %s --role manager --user <n> --update_threshold <district> <value>\n"
-        "  %s --role <role> --user <n> --filter <district> <cond> [<cond>...]\n",
-        prog, prog, prog, prog, prog, prog);
+        "  %s --role <role> --user <n> --filter <district> <cond> [<cond>...]\n"
+        "  %s --role manager --user <n> --remove_district <district>\n",
+        prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char *argv[]) {
@@ -646,6 +742,13 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         cmd_filter(district, role, user, conds, nconds);
+
+    } else if (strcmp(command, "remove_district") == 0) {
+        if (!district) {
+            fprintf(stderr, "ERROR: --remove_district requires <district>\n");
+            return 1;
+        }
+        cmd_remove_district(district, role);
 
     } else {
         fprintf(stderr, "ERROR: unknown command '--%s'\n", command);
